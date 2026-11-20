@@ -30,6 +30,7 @@
 #include "veyra/engine/CapturePreviewClock.h"
 #include "veyra/engine/DisplayFgBudget.h"
 #include "veyra/engine/AdaptiveFgMultiplier.h"
+#include "veyra/engine/StreamArrivalRate.h"
 #include "veyra/engine/FramePacingRepair.h"
 #include "veyra/source/MediaFileSource.h"
 #include "veyra/source/CaptureCardSource.h"
@@ -1258,6 +1259,9 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
             // Adaptive multiplier (AdaptiveFgMultiplier.h, from PushFPS): per-pair multiplier from
             // the measured content rate, the configured one being the ceiling.
             AdaptiveFgGate adaptiveFgGate;bool adaptiveFgWas=false;int64_t nextAdaptiveFgLog=0;
+            // Network streams: the decoded-frame rate the console really sends (StreamArrivalRate.h),
+            // the adaptive multiplier's content rate while duplicate removal has none.
+            StreamArrivalRate streamArrivalRate;
             static const double displayFgTestHz=[]{wchar_t v[16]{};return GetEnvironmentVariableW(L"VEYRA_TEST_DISPLAY_HZ",v,16)?std::clamp(_wtof(v),0.0,1000.0):0.0;}();
             // Live graph FG presents on a smoothed anchor (LiveArrivalSmoother).
             // VEYRA_TEST_LEGACY_LIVE_PACING=1 restores the callback anchor, the
@@ -2495,6 +2499,12 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
                 const bool cadenceBoundary=presentationGenerationResetRequired(reset,pkt.flags);
                 if(cadenceBoundary)captureSampler.reset();
                 const int64_t samplePts100ns=captureClockCorrected?pkt.pts.to100ns():driverPts100ns;
+                // Every decoded stream frame, before duplicate removal: the source's frame numbers
+                // also count the frames this loop never read. A new session or reconnect starts over.
+                if(isStream&&!rereadCached){
+                    if(pipeline::hasFrameFlag(pkt.flags,pipeline::FrameFlagBits::Open)||pipeline::hasFrameFlag(pkt.flags,pipeline::FrameFlagBits::Discontinuity))streamArrivalRate.reset();
+                    streamArrivalRate.observe(pkt.sequence,pkt.arrivalHost100ns?pkt.arrivalHost100ns:pkt.decodedHost100ns?pkt.decodedHost100ns:host100ns());
+                }
                 if(dedupActive&&!rereadCached&&!pkt.pts.isUnknown()){
                     const auto interval=capturePeriod;
                     pipeline::PictureReference::Result picture;
@@ -2712,6 +2722,15 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
                 // (Fix ported from PushFPS 9d4e61a2.)
                 const double pairContentFps=isImage?0.0:dedupActive?contentDedup.contentFps():
                     activeSource->info().averageFps*(halfRate?0.5:1.0);
+                // For PS5 / Moonlight / Xbox that rate is the requested profile (a PS5 30 FPS
+                // profile always says 30) or, with duplicate removal on, 0: hardware-decoded frames
+                // have no CPU picture to compare. The adaptive multiplier then never saw a game dip
+                // (field log 2026-11-20: inputFps 20-28, adaptive-fg fixed at one multiplier or
+                // silent). It follows the measured decoded-frame rate instead whenever duplicate
+                // removal has no rate of its own. Capture cards and CPU pictures are unchanged.
+                const double streamFps=isStream&&!isImage&&!(dedupActive&&contentDedup.contentFps()>0)?streamArrivalRate.fps():0.0;
+                const double adaptiveContentFps=streamFps>0?streamFps:pairContentFps;
+                const char* adaptiveRateSource=streamFps>0?"stream-arrival":dedupActive?"content-dedup":"source-profile";
                 // Adaptive multiplier: the chosen multiplier becomes a ceiling and every pair uses
                 // the one whose output lands closest to the target (the output cap when one is set,
                 // otherwise the display refresh). Only the per-pair multiplier changes, never the
@@ -2723,13 +2742,13 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
                     const double refresh=displayFgTestHz>0?displayFgTestHz:presenter.displayRefreshHz();
                     const double target=presentationEffective.outputRate==OutputRateMode::Custom&&std::isfinite(presentationEffective.customFps)&&
                         presentationEffective.customFps>0?presentationEffective.customFps:refresh;
-                    if(pairContentFps>0.01&&target>0.01){
+                    if(adaptiveContentFps>0.01&&target>0.01){
                         bool changed=false;
                         const auto now100=host100ns();
-                        previewFgMultiplier=adaptiveFgGate.update(adaptiveFgMultiplier(options.settings.frameGenerationBackend,options.fgMultiplier,pairContentFps,target),now100,&changed);
+                        previewFgMultiplier=adaptiveFgGate.update(adaptiveFgMultiplier(options.settings.frameGenerationBackend,options.fgMultiplier,adaptiveContentFps,target),now100,&changed);
                         if(changed||now100>=nextAdaptiveFgLog){nextAdaptiveFgLog=now100+50000000;
-                            veyra::log::info("adaptive-fg",std::format("revision={} backend={} ceiling={}X chosen={}X contentFps={:.2f} targetFps={:.2f} outputFps={:.2f} changed={}",
-                                options.settings.revision,frameGenerationBackendName(options.settings.frameGenerationBackend),options.fgMultiplier,previewFgMultiplier,pairContentFps,target,pairContentFps*previewFgMultiplier,changed));}
+                            veyra::log::info("adaptive-fg",std::format("revision={} backend={} ceiling={}X chosen={}X contentFps={:.2f} targetFps={:.2f} outputFps={:.2f} changed={} rateSource={}",
+                                options.settings.revision,frameGenerationBackendName(options.settings.frameGenerationBackend),options.fgMultiplier,previewFgMultiplier,adaptiveContentFps,target,adaptiveContentFps*previewFgMultiplier,changed,adaptiveRateSource));}
                     }else if(adaptiveFgGate.valid())previewFgMultiplier=adaptiveFgGate.applied();
                 }
                 if(!adaptiveFg&&options.fg&&previewFgMultiplier>2&&presentationEffective.outputRate==OutputRateMode::Custom&&
